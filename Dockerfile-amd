@@ -1,0 +1,112 @@
+#################################################
+#### SETUP ROCM-5.7 and CLBlas and rocBLAS  #####
+#################################################
+FROM rocm/dev-ubuntu-22.04:5.7 AS rocm
+
+# Login as root user.    
+USER root
+
+# Install dependencies and rocm-5.7
+RUN apt-get update -y && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \ 
+    sudo wget git rocsparse-dev hipsparse-dev rocthrust-dev rocblas-dev hipblas-dev \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+COPY sudo-nopasswd /etc/sudoers.d/sudo-nopasswd
+RUN useradd --create-home -G sudo,video --shell /bin/bash rocm-user
+USER rocm-user
+WORKDIR /home/rocm-user
+ENV PATH "${PATH}:/opt/rocm/bin"
+
+############################################
+######### SETUP rocBLAS & hipBLAS  #########
+############################################
+FROM rocm as rocm-rocblas-hipblas
+
+# Login as root user.    
+USER root
+
+# Install dependencies, rocblas & hipblas
+RUN apt-get update && \
+  apt-get install -y rocblas-dev hipblas-dev wget git cmake build-essential && \
+  rm -rf /var/lib/apt/lists/*
+
+##################################
+######### SETUP clBLAST  #########
+##################################
+FROM rocm-rocblas-hipblas AS rocm-clblas
+
+# Login as root user.    
+USER root
+
+# Set env for building and installing clblas
+ENV HSA_OVERRIDE_GFX_VERSION=10.3.0
+RUN git clone https://github.com/CNugteren/CLBlast.git && \
+  cd CLBlast && \
+  mkdir build && \
+  cd build && \
+  cmake .. && \
+  make && \
+  make install
+
+##############################################
+######### SETUP MiniConda & PyTorch  #########
+##############################################
+# FROM rocm-clblas AS rocm-conda
+
+# # Login as root user.    
+# USER root
+
+# # Add the conda to PATH 
+# ENV PATH="/root/miniconda3/bin:${PATH}"
+# ARG PATH="/root/miniconda3/bin:${PATH}"
+
+# # Install and setup MiniConda
+# RUN wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh \
+#     && mkdir .conda \
+#     && bash Miniconda3-latest-Linux-x86_64.sh -b \
+#     && rm -f Miniconda3-latest-Linux-x86_64.sh
+
+# # Copy the environment.yaml file to create conda environment
+# COPY environment.yaml .
+
+# # Create the conda environment and activate it
+# RUN conda env create -f environment.yaml \
+#     && echo "source activate alltalk-tts" > ~/.bashrc
+
+# # Add conda environment to PATH
+# ENV PATH /root/miniconda3/envs/tts-generation-webui/bin:$PATH
+
+# # Ensure the environment is activated by default when running the container
+# SHELL ["conda", "run", "-n", "alltalk-tts", "/bin/bash", "-c"]
+
+#######################################
+######### SETUP ALLTALK-TTS  ##########
+####################################### 
+# FROM rocm-conda AS alltalk-tts-rocm
+FROM rocm-clblas AS alltalk-tts-rocm
+
+ENV ROCM_PATH=/opt/rocm
+ENV CLBlast_DIR=/usr/lib/cmake/CLBlast
+USER rocm-user
+
+RUN sudo apt-get update && sudo apt-get upgrade -y \
+    && sudo apt-get install -y git build-essential portaudio19-dev \
+    python3 python3-pip gcc wget \
+    ocl-icd-opencl-dev opencl-headers clinfo \
+    libclblast-dev libopenblas-dev libaio-dev \
+    && mkdir -p /etc/OpenCL/vendors && echo "libamdrocopencl.so" | sudo tee /etc/OpenCL/vendors/amd.icd \
+    && sudo ln -s /usr/bin/python3 /usr/bin/python
+
+# Install specific packages using pip
+WORKDIR /app
+COPY . .
+ENV CUDA_DOCKER_ARCH=all
+RUN pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm5.7
+RUN pip install --no-cache-dir --no-deps -r system/requirements/requirements_docker.txt && \
+    pip install --no-cache-dir deepspeed
+
+ENV HOST 0.0.0.0
+EXPOSE 7851 7852
+RUN chmod +x launch.sh
+ENTRYPOINT ["sh", "-c", "./launch.sh"]
